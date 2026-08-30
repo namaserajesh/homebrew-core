@@ -201,10 +201,8 @@ class Llvm < Formula
     end
 
     # Skip the PGO build on HEAD installs, non-bottle source builds, or versioned formulae.
-    # Also skip Intel macOS which is slow and will be reduced to Tier 3 in Sept 2026.
-    # TODO: Fix Linux PGO build which is currently dead code
-    pgo_build = build.stable? && build.bottle? && OS.mac? && Hardware::CPU.arm? && !versioned_formula?
-    lto_build = pgo_build && OS.mac?
+    pgo_build = build.stable? && build.bottle? && !versioned_formula?
+    lto_build = pgo_build
 
     if ENV.cflags.present?
       args << "-DCMAKE_C_FLAGS=#{ENV.cflags}" unless pgo_build
@@ -238,28 +236,32 @@ class Llvm < Formula
         "-DLLVM_ENABLE_PROJECTS=clang;lld",
         "-DLLVM_ENABLE_RUNTIMES=compiler-rt",
       ]
+      if OS.mac?
+        extra_args << "-DLLVM_ENABLE_LIBCXX=ON"
+        extra_args += clt_sdk_support_flags
+      end
 
       # Our stage1 compiler includes the minimum necessary to bootstrap.
       # `llvm-profdata` is needed for profile data pre-processing, and
       # `compiler-rt` to consume profile data.
       stage1_targets = ["clang", "llvm-profdata", "compiler-rt"]
-      stage1_targets += if OS.mac?
-        extra_args << "-DLLVM_ENABLE_LIBCXX=ON"
-        extra_args += clt_sdk_support_flags
-
-        args << "-DLLVM_ENABLE_LTO=Thin" if lto_build
-        # LTO creates object files not recognised by Apple libtool.
-        args << "-DCMAKE_LIBTOOL=#{llvmpath}/stage1/bin/llvm-libtool-darwin"
-
-        # These are needed to enable LTO.
-        ["llvm-libtool-darwin", "LTO"]
-      else
-        # Make sure CMake doesn't try to pass C++-only flags to C compiler.
-        extra_args << "-DCMAKE_C_COMPILER=#{ENV.cc}"
-        extra_args << "-DCMAKE_CXX_COMPILER=#{ENV.cxx}"
-
-        # We use this as the linker on Linux to control RPATH.
-        ["lld"]
+      stage1_targets << "lld" if OS.linux? # We use lld on Linux to control RPATH.
+      if lto_build
+        args << "-DLLVM_ENABLE_LTO=Thin"
+        args += if OS.mac?
+          # LTO creates object files not recognised by Apple libtool.
+          stage1_targets += ["llvm-libtool-darwin", "LTO"]
+          %W[
+            -DCMAKE_LIBTOOL=#{llvmpath}/stage1/bin/llvm-libtool-darwin
+          ]
+        else
+          stage1_targets += ["llvm-ar", "llvm-ranlib"]
+          %W[
+            -DCMAKE_AR=#{llvmpath}/stage1/bin/llvm-ar
+            -DCMAKE_RANLIB=#{llvmpath}/stage1/bin/llvm-ranlib
+            -DLLVM_ENABLE_FATLTO=ON
+          ]
+        end
       end
 
       cflags = ENV.cflags&.split || []
@@ -307,8 +309,6 @@ class Llvm < Formula
         ]
         linux_include_paths.each { |path| cxxflags << "-isystem#{path}" }
 
-        # Unset CMAKE_C_COMPILER and CMAKE_CXX_COMPILER so we can set them below.
-        extra_args.reject! { |s| s[/CMAKE_C(XX)?_COMPILER/] }
         extra_args.reject! { |s| s["CMAKE_CXX_FLAGS"] }
         extra_args << "-DCMAKE_CXX_FLAGS=#{cxxflags.join(" ")}"
       end
@@ -379,11 +379,14 @@ class Llvm < Formula
 
       args << "-DCMAKE_C_FLAGS=#{cflags.join(" ")}"
       args << "-DCMAKE_CXX_FLAGS=#{cxxflags.join(" ")}"
+
+      # Since we don't build lld for installation, `-fuse-ld=lld` needs to find lld in PATH
+      ENV.append_path "PATH", llvmpath/"stage1/bin" if OS.linux?
     end
 
     # Now, we can build.
     mkdir llvmpath/"build" do
-      system "cmake", "-G", "Ninja", "..", *(std_cmake_args + args)
+      system "cmake", "-G", "Ninja", "..", *std_cmake_args, *args
       system "cmake", "--build", "."
       system "cmake", "--build", ".", "--target", "install"
     end
@@ -447,10 +450,18 @@ class Llvm < Formula
     end
 
     return unless lto_build
+    return if OS.linux? # TODO: check on impact of strip once build is successful
 
-    # Convert LTO-generated bitcode in our static archives to MachO. Adapted from Fedora:
-    # https://src.fedoraproject.org/rpms/redhat-rpm-config/blob/rawhide/f/brp-llvm-compile-lto-elf
     lib.glob("*.a").each do |static_archive|
+      # Strip embedded bitcode from fat LTO objects on Linux similar to upstream release builds
+      # https://github.com/llvm/llvm-project/blob/llvmorg-23.1.0/clang/cmake/caches/release_cpack_pre_build_strip_lto.cmake
+      if OS.linux?
+        system bin/"llvm-strip", "--no-strip-all", "-R", ".llvm.lto", static_archive, "-o", static_archive
+        next
+      end
+
+      # Convert LTO-generated bitcode in our static archives to MachO. Adapted from Fedora:
+      # https://src.fedoraproject.org/rpms/redhat-rpm-config/blob/1c5e204554732b224956618610a990e7acd74f62/f/brp-llvm-compile-lto-elf
       mktemp do
         system bin/"llvm-ar", "x", static_archive
         rebuilt_files = []
